@@ -1,174 +1,164 @@
 import socket
+import time
+import threading
 import numpy as np
 import tenseal as ts
 
+PLAIN_MODULUS = 1032193
 
-# Initialize TenSEAL BFV context
-PLAIN_MODULUS = 1032193  # Store plain modulus separately
+# Global counters for bandwidth
+TOTAL_BYTES_SENT = 0
+TOTAL_BYTES_RECEIVED = 0
+BW_LOCK = threading.Lock()  # lock to protect counters
 
-context = ts.context(
-    scheme=ts.SCHEME_TYPE.BFV,
-    poly_modulus_degree=8192,
-    coeff_mod_bit_sizes=[40, 40, 40],  # BFV moduli
-    plain_modulus=PLAIN_MODULUS  # Set manually
-)
-context.generate_galois_keys()
-context.generate_relin_keys()
-
-# Serialize context
-context_bytes = context.serialize()
+def create_ckks_context():
+    context = ts.context(
+        scheme=ts.SCHEME_TYPE.CKKS,
+        poly_modulus_degree=8192,
+        coeff_mod_bit_sizes=[60, 40, 40, 60]
+    )
+    context.global_scale = 2**40
+    context.generate_galois_keys()
+    return context
 
 def split_into_shares(secret_vector):
-    """ Splits a fingerprint template into two secret shares. """
-    s2 = np.random.rand(*secret_vector.shape)  # Use random float values
-    s1 = secret_vector - s2  # Ensure sum of shares reconstructs original
+    s2 = np.random.rand(*secret_vector.shape)
+    s1 = secret_vector - s2
     return s1, s2
 
-
-
-# Function to send large data
 def send_large_data(sock, data_bytes):
-    """Send large data with a size prefix."""
-    data_size = len(data_bytes)
-    sock.sendall(data_size.to_bytes(4, 'big'))
+    """Send data with size prefix, track total bytes sent."""
+    global TOTAL_BYTES_SENT
+    size = len(data_bytes)
+    size_prefix = size.to_bytes(4, 'big')
+    # increment counters
+    with BW_LOCK:
+        TOTAL_BYTES_SENT += len(size_prefix) + size
+    # send
+    sock.sendall(size_prefix)
     sock.sendall(data_bytes)
 
-# Function to receive large data
 def receive_large_data(sock):
-    """Receive large data in chunks based on the size prefix."""
-    data_size = int.from_bytes(sock.recv(4), 'big')  # Read size first
-    data_bytes = b""
+    """Receive data with size prefix, track total bytes read."""
+    global TOTAL_BYTES_RECEIVED
+    size_prefix = sock.recv(4)
+    if len(size_prefix) < 4:
+        raise ConnectionError("Connection closed prematurely")
+    size = int.from_bytes(size_prefix, 'big')
+    with BW_LOCK:
+        TOTAL_BYTES_RECEIVED += 4 + size
 
-    # Read the expected data size in chunks
-    CHUNK_SIZE = 4096
-    while len(data_bytes) < data_size:
-        chunk = sock.recv(min(CHUNK_SIZE, data_size - len(data_bytes)))
+    data = b""
+    while len(data) < size:
+        chunk = sock.recv(min(131072, size - len(data)))
         if not chunk:
-            raise ConnectionError("Connection closed before receiving full data")
-        data_bytes += chunk
+            raise ConnectionError("Connection closed prematurely")
+        data += chunk
+    return data
 
-    return data_bytes
+def send_and_receive_server(
+    host, port,
+    biometric_id,
+    ctx_bytes,
+    enc_share_bytes,
+    context,
+    result_dict,
+    result_key
+):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((host, port))
 
+    send_large_data(sock, biometric_id.encode())
+    send_large_data(sock, ctx_bytes)
+    send_large_data(sock, enc_share_bytes)
 
+    partial_diff_bytes = receive_large_data(sock)
+    sock.close()
 
-# Define the biometric ID to send
-#biometric_id = input("Enter Biometric ID: ")
+    result_dict[result_key] = ts.ckks_vector_from(context, partial_diff_bytes)
+
+# Main Client Code
+overall_start = time.perf_counter()
+
+context_creation_start = time.perf_counter()
+context = create_ckks_context()
+context_creation_end = time.perf_counter()
+
+ctx_bytes = context.serialize()
+
+probe = np.load("IrisFingerprintDatabases/FingerprintDatabase/3567/3567d11.npy")
+p1, p2 = split_into_shares(probe)
+
+encrypt_start = time.perf_counter()
+Enc_p1 = ts.ckks_vector(context, p1.tolist())
+Enc_p2 = ts.ckks_vector(context, p2.tolist())
+encrypt_end = time.perf_counter()
+encrypt_time = encrypt_end - encrypt_start
+
 biometric_id = "3567"
+ctx_size = len(ctx_bytes)
+enc_p1_bytes = Enc_p1.serialize()
+enc_p2_bytes = Enc_p2.serialize()
+enc_p1_size = len(enc_p1_bytes)
+enc_p2_size = len(enc_p2_bytes)
 
-probe = np.load(f"IrisFingerprintDatabases/FingerprintDatabase/3567/3567d11.npy")
+results = {}
 
+parallel_start = time.perf_counter()
 
-p_1, p_2 = split_into_shares(probe)
+t1 = threading.Thread(
+    target=send_and_receive_server,
+    args=(
+        "127.0.0.1", 65431,
+        biometric_id, ctx_bytes, enc_p1_bytes,
+        context, results, "res1"
+    )
+)
+t2 = threading.Thread(
+    target=send_and_receive_server,
+    args=(
+        "127.0.0.1", 65432,
+        biometric_id, ctx_bytes, enc_p2_bytes,
+        context, results, "res2"
+    )
+)
 
-#scale probes
-p_1 = p_1*1000
-p_2 = p_2*1000
+t1.start()
+t2.start()
+t1.join()
+t2.join()
 
+parallel_end = time.perf_counter()
 
-# Encrypt P1 and P2 using BFV
-Enc_p1 = ts.bfv_vector(context, p_1.tolist())
-Enc_p2 = ts.bfv_vector(context, p_2.tolist())
+enc_res1 = results["res1"]
+enc_res2 = results["res2"]
 
+combine_start = time.perf_counter()
+enc_total_diff = enc_res1 + enc_res2
+enc_sq_diff = enc_total_diff * enc_total_diff
+enc_sq_dist = enc_sq_diff.sum()
+dec_sq_dist = enc_sq_dist.decrypt()[0] % PLAIN_MODULUS
+dist = np.sqrt(dec_sq_dist)
+combine_end = time.perf_counter()
+overall_end = time.perf_counter()
 
-## 🔹 Send ID & Encrypted p_1 to Server 1 ##
-try:
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.connect(("127.0.0.1", 65431))
+print(f"Euclidean Distance: {dist}")
 
-    # Send the ID and wait for acknowledgment before proceeding
-    client_socket.sendall(biometric_id.encode())
+print("\n==== BENCHMARK RESULTS ====")
 
-    # 2️⃣ Wait for the server's ACK response
-    ack = client_socket.recv(1024)
-    if ack != b"ACK":
-        print("Error: Server 1 did not acknowledge ID.")
-        client_socket.close()
-        exit()
+print("\n-- Times --")
+print(f"Context creation time:    {context_creation_end - context_creation_start:.6f} s")
+print(f"Encryption time (p1,p2):  {encrypt_time:.6f} s")
+print(f"Server round-trip time:   {(parallel_end - parallel_start):.6f} s")
+print(f"Final combine & decrypt:  {(combine_end - combine_start):.6f} s")
+print(f"Total client time:        {(overall_end - overall_start):.6f} s")
 
-    # 3️⃣ Send the context only after receiving the ACK
-    send_large_data(client_socket, context_bytes)
+print("\n-- Data Sizes (bytes) --")
+print(f"Context size:             {ctx_size}")
+print(f"Encrypted share 1 size:   {enc_p1_size}")
+print(f"Encrypted share 2 size:   {enc_p2_size}")
 
-    # 4️⃣ Wait for another ACK before sending the probe share
-    ack = client_socket.recv(1024)
-    if ack != b"ACK":
-        print("Error: Server 1 did not acknowledge context.")
-        client_socket.close()
-        exit()
-
-    # 5️⃣ Send the encrypted probe share
-    send_large_data(client_socket, Enc_p1.serialize())
-
-    # 6️⃣ Receive encrypted squared distance result
-    Enc_result1 = ts.bfv_vector_from(context, receive_large_data(client_socket))
-
-finally:
-    client_socket.close()
-
-
-## 🔹 Send ID & Encrypted p_2 to Server 2 ##
-try:
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.connect(("127.0.0.1", 65432))
-
-    # Send the ID and wait for acknowledgment before proceeding
-    client_socket.sendall(biometric_id.encode())
-
-    # 2️⃣ Wait for the server's ACK response
-    ack = client_socket.recv(1024)
-    if ack != b"ACK":
-        print("Error: Server 1 did not acknowledge ID.")
-        client_socket.close()
-        exit()
-
-    # 3️⃣ Send the context only after receiving the ACK
-    send_large_data(client_socket, context_bytes)
-
-    # 4️⃣ Wait for another ACK before sending the probe share
-    ack = client_socket.recv(1024)
-    if ack != b"ACK":
-        print("Error: Server 1 did not acknowledge context.")
-        client_socket.close()
-        exit()
-
-    # 5️⃣ Send the encrypted probe share
-    send_large_data(client_socket, Enc_p2.serialize())
-
-    # 6️⃣ Receive encrypted squared distance result
-    Enc_result2 = ts.bfv_vector_from(context, receive_large_data(client_socket))
-
-finally:
-    client_socket.close()
-
-
-## 🔹 Compute Final Secure Distance ##
-Enc_total_difference = Enc_result1 + Enc_result2
-
-# Mahattan distance
-Enc_manhattan_distance = Enc_total_difference.sum()
-manhattan_distance = abs(Enc_manhattan_distance.decrypt()[0])
-
-# Euclidean distance
-Enc_squared_difference = Enc_total_difference * Enc_total_difference
-Enc_squared_distance = Enc_squared_difference.sum()
-#must decrypt before taking square root (but its safe)
-decrypted_squared_distance = Enc_squared_distance.decrypt()[0] % PLAIN_MODULUS
-euclidean_distance = np.sqrt(decrypted_squared_distance)
-
-# Print match result
-print(f"Euclidean Distance: {euclidean_distance}")
-print(f"Manhattan Distance: {manhattan_distance}")
-
-
-# Matching thresholds
-threshold_1 = 20  # Identical templates expected to be below 20
-threshold_2 = 500  # Same finger, different template
-threshold_3 = 800 # Different finger
-
-if euclidean_distance <= threshold_1:
-    print("Identical fingerprints")
-elif euclidean_distance <= threshold_2:
-    print("Most definitely a match")
-elif euclidean_distance <= threshold_3:
-    print("Cannot determine, needs further investigation")
-else:
-    print("Not a match")
+print("\n-- Bandwidth (Bytes) --")
+print(f"Total bytes sent:         {TOTAL_BYTES_SENT}")
+print(f"Total bytes received:     {TOTAL_BYTES_RECEIVED}")
+print(f"Sum (sent+received):      {TOTAL_BYTES_SENT + TOTAL_BYTES_RECEIVED}")

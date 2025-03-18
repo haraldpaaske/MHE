@@ -2,9 +2,9 @@ from pathlib import Path
 import numpy as np
 
 # Define paths using pathlib
-input_folder = Path("IrisFingerprintDatabases/FingerprintDatabase")
-server1_folder = Path("server1_database")
-server2_folder = Path("server2_database")
+input_folder = Path("IrisFingerprintDatabases/IrisDatabase")
+server1_folder = Path("server1_iris_database")
+server2_folder = Path("server2_iris_database")
 
 # Ensure output folders exist
 server1_folder.mkdir(parents=True, exist_ok=True)

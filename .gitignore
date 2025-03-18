@@ -1,0 +1,7 @@
+server1_database
+server1_iris_database
+server2_database
+server2_iris_database
+IrisFingerprintDatabases
+comparison_scores
+all_probe_distances.npy
